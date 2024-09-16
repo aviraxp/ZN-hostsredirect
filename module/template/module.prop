@@ -1,0 +1,7 @@
+id=${moduleId}
+name=${moduleName}
+version=${versionName}
+versionCode=${versionCode}
+author=aviraxp
+description=Redirect hosts file to /data/adb/hostsredirect/hosts by injecting netd
+#updateJson=
