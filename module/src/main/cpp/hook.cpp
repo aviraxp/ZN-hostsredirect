@@ -1,7 +1,4 @@
-#include <cstring>
 #include <android/log.h>
-#include <dlfcn.h>
-#include <cstdio>
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -11,35 +8,36 @@
 #include "zygisk_next_api.h"
 #include "socket_utils.h"
 
+#define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, "hostsredirect", __VA_ARGS__)
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, "hostsredirect", __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, "hostsredirect", __VA_ARGS__)
 
 static ZygiskNextAPI api_table;
 void* handle;
 
-long setfilecon(const char* path, const char* con) {
-    return syscall(__NR_setxattr, path, XATTR_NAME_SELINUX, con, strlen(con) + 1, 0);
-}
-
-static FILE*(*old_fopen)(const char *name, const char *mode) = nullptr;
-static FILE* my_fopen(const char *name, const char *mode) {
-    // https://cs.android.com/android/platform/superproject/main/+/main:packages/modules/DnsResolver/getaddrinfo.cpp;l=1467;drc=a4ac93b700ed623bdb333ccb2ac567b8a33081a7;bpv=0;bpt=1
-    if (strcmp(name, "/system/etc/hosts") == 0) {
-        auto fd = api_table.connectCompanion(handle);
-        if (fd < 0) {
-            LOGE("failed to connect to companion");
-            return old_fopen(name, mode);
-        }
-        auto file_fd = socket_utils::recv_fd(fd);
-        if (file_fd < 0) {
-            LOGE("failed to get hosts file");
-            close(fd);
-            return old_fopen(name, mode);
-        }
-        close(fd);
-        return fdopen(file_fd, "r");
+// backup of old __openat function
+static int (*old_openat)(int fd, const char* pathname, int flag, int mode) = nullptr;
+// our replacement for __openat function
+static int my_openat(int fd, const char* pathname, int flag, int mode) {
+    // https://android.googlesource.com/platform/system/netd/+/55864199479074e8fb3d285220280ccda270fe7d
+    // https://github.com/LineageOS/android_system_netd/commit/f92bf2804098512142cc8d7934ed9d5031b0532c
+    if (strcmp(pathname, "/system/etc/hosts") != 0) {
+        return old_openat(fd, pathname, flag, mode);
     }
-    return old_fopen(name, mode);
+
+    auto cp_fd = api_table.connectCompanion(handle);
+    if (cp_fd < 0) {
+        return old_openat(fd, pathname, flag, mode);
+    }
+
+    auto file_fd = socket_utils::recv_fd(cp_fd);
+    close(cp_fd);
+
+    if (file_fd < 0) {
+        return old_openat(fd, pathname, flag, mode);
+    }
+
+    return file_fd;
 }
 
 // this function will be called after all of the main executable's needed libraries are loaded
@@ -49,10 +47,25 @@ void onModuleLoaded(void* self_handle, const struct ZygiskNextAPI* api) {
     memcpy(&api_table, api, sizeof(struct ZygiskNextAPI));
     handle = self_handle;
 
-    // inline hook netd's fopen function
-    auto fun = dlsym(RTLD_DEFAULT, "fopen");
-    if (api_table.inlineHook(fun, (void *) my_fopen, (void**) &old_fopen) == ZN_SUCCESS) {
-        LOGI("inline hook success %p", old_fopen);
+    auto resolver = api_table.newSymbolResolver("libc.so", nullptr);
+    if (!resolver) {
+        LOGE("create resolver failed");
+        return;
+    }
+
+    size_t sz;
+    auto addr = api_table.symbolLookup(resolver, "__openat", false, &sz);
+
+    api_table.freeSymbolResolver(resolver);
+
+    if (addr == nullptr) {
+        LOGE("failed to find __openat");
+        return;
+    }
+
+    // inline hook netd's openat function
+    if (api_table.inlineHook(addr, (void *) my_openat, (void**) &old_openat) == ZN_SUCCESS) {
+        LOGI("inline hook success %p", old_openat);
     } else {
         LOGE("inline hook failed");
     }
@@ -65,23 +78,26 @@ struct ZygiskNextModule zn_module = {
         .onModuleLoaded = onModuleLoaded,
 };
 
-void onCompanionLoaded() {
+static void onCompanionLoaded() {
     LOGI("companion loaded");
 }
 
-void onModuleConnected(int fd) {
-    const char* hosts = "/data/adb/hostsredirect/hosts";
+static void onModuleConnected(int fd) {
+    auto hosts = "/data/adb/hostsredirect/hosts";
     struct stat st{};
     if (stat(hosts, &st) < 0) {
-        LOGE("no hosts file found");
+        LOGD("no hosts file found");
         close(fd);
         return;
     }
+
     // netd needs to access hosts file socket
-    setfilecon(hosts, "u:object_r:system_file:s0");
+    auto system_file = "u:object_r:system_file:s0";
+    syscall(__NR_setxattr, hosts, XATTR_NAME_SELINUX, system_file, strlen(system_file) + 1, 0);
+
     auto hosts_fd = open(hosts, O_RDONLY | O_CLOEXEC);
     if (hosts_fd < 0) {
-        LOGE("failed to open hosts file");
+        LOGD("failed to open hosts file");
         close(fd);
         return;
     }
