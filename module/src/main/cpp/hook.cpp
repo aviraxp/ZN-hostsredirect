@@ -92,8 +92,16 @@ static void onModuleConnected(int fd) {
     }
 
     // netd needs to access hosts file socket
-    auto system_file = "u:object_r:system_file:s0";
-    syscall(__NR_setxattr, hosts, XATTR_NAME_SELINUX, system_file, strlen(system_file) + 1, 0);
+    static decltype(st.st_dev) last_dev{};
+    static decltype(st.st_ino) last_ino{};
+    static decltype(st.st_mtime) last_mtime{};
+    if (st.st_dev != last_dev || st.st_ino != last_ino || st.st_mtime != last_mtime) {
+        auto system_file = "u:object_r:system_file:s0";
+        syscall(__NR_setxattr, hosts, XATTR_NAME_SELINUX, system_file, strlen(system_file) + 1, 0);
+        last_dev = st.st_dev;
+        last_ino = st.st_ino;
+        last_mtime = st.st_mtime;
+    }
 
     auto hosts_fd = open(hosts, O_RDONLY | O_CLOEXEC);
     if (hosts_fd < 0) {

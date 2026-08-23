@@ -243,15 +243,6 @@ namespace socket_utils {
     }
 
     int recv_fd(int sockfd) {
-        // Peek fd count
-        int cnt;
-        recv(sockfd, &cnt, sizeof(cnt), MSG_PEEK);
-        if (cnt == 0) {
-            // Consume data
-            recv(sockfd, &cnt, sizeof(cnt), MSG_WAITALL);
-            return -1;
-        }
-
         char cmsgbuf[CMSG_SPACE(sizeof(int))];
 
         void *data = recv_fds(sockfd, cmsgbuf, sizeof(cmsgbuf), 1);
